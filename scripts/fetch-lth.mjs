@@ -44,13 +44,26 @@ async function circulating() {
   return c != null && c > 18e6 && c < 21e6 ? c : 19.9e6;
 }
 
-// --- source 1: BGeometrics (bitcoin-data.com), 155-day LTH definition ---
+// --- BGeometrics (bitcoin-data.com), 155-day LTH definition ---
+// Endpoint confirmed by the discovery run: /v1/long-term-hodler-supply-btc.
+// The value field's exact name is unknown, so take the first numeric field
+// that isn't a date/timestamp; the 40–90% sanity gate rejects wrong picks.
+const TIME_KEYS = /^(d|date|day|theDay|unixTs|unix_ts|timestamp|time)$/;
+function rowValue(o) {
+  for (const k of Object.keys(o)) {
+    if (TIME_KEYS.test(k)) continue;
+    const n = num(o[k]);
+    if (n != null) return n;
+  }
+  return null;
+}
 function bgeoSeries(body, circ) {
   const arr = Array.isArray(body) ? body : Array.isArray(body?.data) ? body.data : null;
   if (!arr || arr.length < 2) return null;
   const out = [];
   for (const o of arr) {
-    const v = num(o.lthSupply ?? o.lth_supply ?? o.value ?? o.supply);
+    if (!o || typeof o !== "object") continue;
+    const v = rowValue(o);
     if (v == null) continue;
     const pct = v > 100 ? (v / circ) * 100 : v;
     let t = null;
@@ -58,21 +71,6 @@ function bgeoSeries(body, circ) {
     if (d) { const p = Date.parse(d); if (isFinite(p)) t = p; }
     if (t == null) { const u = num(o.unixTs ?? o.timestamp); if (u != null) t = u > 1e12 ? u : u * 1000; }
     if (sanePct(pct) && t != null) out.push({ t, pct: +pct.toFixed(2) });
-  }
-  return out.length > 2 ? out : null;
-}
-
-// --- source 2: CoinMetrics community, 180-day active-supply complement ---
-function cmSeries(body) {
-  const rows = body?.data;
-  if (!Array.isArray(rows) || rows.length < 2) return null;
-  const out = [];
-  for (const o of rows) {
-    const act = num(o.SplyAct180d), cur = num(o.SplyCur);
-    if (act == null || cur == null || cur <= 0) continue;
-    const pct = (1 - act / cur) * 100;
-    const t = Date.parse(o.time);
-    if (sanePct(pct) && isFinite(t)) out.push({ t, pct: +pct.toFixed(2) });
   }
   return out.length > 2 ? out : null;
 }
@@ -88,18 +86,16 @@ async function main() {
   await probe("goldprice.org dbXRates", "https://data-asg.goldprice.org/dbXRates/USD");
   await probe("coingecko PAXG/KAG proxy", "https://api.coingecko.com/api/v3/simple/price?ids=pax-gold,kinesis-silver&vs_currencies=usd");
 
-  // LTH candidates, in the page's order of preference.
-  const cmStart = new Date(Date.now() - (KEEP_DAYS + 10) * DAY).toISOString().slice(0, 10);
+  // LTH candidates. api. host first — the discovery run showed it answers
+  // with Access-Control-Allow-Origin: * while the bare host sends none.
+  // (CoinMetrics was dropped: its community tier has no active-supply metrics.)
   const candidates = [
-    { name: "bitcoin-data.com series", url: "https://bitcoin-data.com/v1/lth-supply",
+    { name: "api.bitcoin-data.com long-term-hodler-supply", url: "https://api.bitcoin-data.com/v1/long-term-hodler-supply-btc",
       parse: (b) => bgeoSeries(b, circ),
       source: "bitcoin-data.com", definition: "155-day LTH definition (BGeometrics)." },
-    { name: "api.bitcoin-data.com series", url: "https://api.bitcoin-data.com/v1/lth-supply",
+    { name: "bitcoin-data.com long-term-hodler-supply", url: "https://bitcoin-data.com/v1/long-term-hodler-supply-btc",
       parse: (b) => bgeoSeries(b, circ),
       source: "bitcoin-data.com", definition: "155-day LTH definition (BGeometrics)." },
-    { name: "coinmetrics SplyAct180d", url: `https://community-api.coinmetrics.io/v4/timeseries/asset-metrics?assets=btc&metrics=SplyAct180d,SplyCur&frequency=1d&page_size=400&start_time=${cmStart}`,
-      parse: cmSeries,
-      source: "CoinMetrics community", definition: "180-day active-supply complement — a close cousin of the 155-day LTH; read the trend, not the exact level." },
   ];
 
   for (const c of candidates) {
