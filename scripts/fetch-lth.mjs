@@ -122,7 +122,42 @@ async function main() {
     return;
   }
   console.error("[fail] every LTH candidate failed — data/lth.json NOT updated");
+  await discover();
   process.exit(1);
+}
+
+// When every candidate fails, hunt for the correct endpoints and print them
+// in the log so the next iteration can be wired against reality.
+async function discover() {
+  console.log("[discover] looking for the real bitcoin-data.com path…");
+  for (const u of [
+    "https://bitcoin-data.com/v3/api-docs",
+    "https://api.bitcoin-data.com/v3/api-docs",
+    "https://bitcoin-data.com/openapi.json",
+    "https://bitcoin-data.com/api-docs",
+    "https://bitcoin-data.com/v2/api-docs",
+  ]) {
+    const r = await probe("openapi " + u, u);
+    if (r.ok && r.body?.paths) {
+      const all = Object.keys(r.body.paths);
+      const hits = all.filter((p) => /lth|supply|hodl|sth/i.test(p));
+      console.log(`[discover] ${all.length} paths total; lth/supply/hodl matches:`);
+      for (const h of hits) console.log(`           ${h}`);
+      break;
+    }
+  }
+  console.log("[discover] CoinMetrics community supply metrics with 1d frequency…");
+  const cat = await probe(
+    "coinmetrics catalog",
+    "https://community-api.coinmetrics.io/v4/catalog-v2/asset-metrics?assets=btc&page_size=10000"
+  );
+  const metrics = cat.body?.data?.[0]?.metrics;
+  if (Array.isArray(metrics)) {
+    const hits = metrics
+      .filter((m) => /sply/i.test(m.metric))
+      .map((m) => `${m.metric}[${(m.frequencies || []).map((f) => f.frequency).join(",")}]`);
+    console.log(`[discover] ${hits.join(" ")}`);
+  }
 }
 
 main();
