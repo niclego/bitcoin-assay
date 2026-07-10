@@ -20,11 +20,12 @@ nothing to configure and nothing to leak.
 
 ## Architecture
 
-Pure static single file, fetch-on-load (brief §4, option 1). Chosen because every leg
-now has a keyless browser source with a fallback chain whose tail is CoinGecko — the
-same origin that already serves the BTC leg — so no proxy, no scheduled Action, and no
-secrets are needed. Refresh cadence is "whenever you open it," which matches the
-weekly/monthly thesis cadence.
+Static single file **plus one scheduled GitHub Action** (brief §4, option 2 — for the
+LTH leg only). Price legs fetch keyless sources on load; the slow-moving LTH leg is
+snapshotted weekly by `.github/workflows/data.yml` (Monday 06:17 UTC, also runs on
+pushes touching the job) into `data/lth.json`, which the page reads **same-origin** —
+CORS can't break it. Live fetches of the same upstream remain as backup. No proxy, no
+keys, no secrets anywhere. Refresh cadence matches the weekly/monthly thesis cadence.
 
 ## Data sources and fallbacks
 
@@ -33,7 +34,7 @@ weekly/monthly thesis cadence.
 | BTC price + market cap | [CoinGecko](https://www.coingecko.com/api) `/coins/markets` (keyless) | localStorage last-good → seed → manual |
 | Gold spot (USD/oz) | [gold-api.com](https://gold-api.com) `XAU` → [goldprice.org](https://goldprice.org) `dbXRates/USD` → CoinGecko **PAXG** tokenized-gold proxy | localStorage last-good → seed → manual |
 | Silver spot (USD/oz) | gold-api.com `XAG` → goldprice.org → CoinGecko **KAG** (Kinesis Silver) proxy | localStorage last-good → seed → manual |
-| Long-term-holder supply % (155-day) | [bitcoin-data.com](https://bitcoin-data.com) (BGeometrics) full series (level + ~90-day direction), tried on both `bitcoin-data.com` and `api.bitcoin-data.com` hosts → `/lth-supply/last` (level only) → [CoinMetrics community](https://docs.coinmetrics.io/api/v4/) `SplyAct180d`/`SplyCur` (180-day active-supply complement — close cousin of 155-day LTH, labelled in the health card when in use) | localStorage last-good → manual entry |
+| Long-term-holder supply % (155-day) | `data/lth.json` — weekly same-origin snapshot written by the GitHub Action from [bitcoin-data.com](https://bitcoin-data.com) (BGeometrics) `/v1/long-term-hodler-supply-btc` → live fetch of the same endpoint (`api.` host first: it sends CORS headers, the bare host doesn't) → `/last` variants | localStorage last-good → manual entry |
 | History sparkline | True ratio: BTC market-cap history ÷ (PAXG price history × fixed stock), both from CoinGecko (≤365 days keyless) | current-cap approximation, with its disclaimer restored |
 
 Gold/silver market caps = spot × fixed above-ground stock (6.952 B oz gold,
@@ -55,28 +56,28 @@ CoinGecko's live circulating supply (fallback 19.9 M if that leg is down).
 
 ## What was actually verified (honesty note)
 
-This build was developed in a sandbox whose network policy **blocked all external data
-APIs**, so the CORS/liveness of the sources could **not** be probed directly. What was
-verified, with a real headless Chromium against the real file:
+The data job doubles as a **liveness/CORS probe**: every run logs each source's HTTP
+status and `Access-Control-Allow-Origin` header. Verified by real runs on GitHub's
+runners (see the Actions log for "Update LTH data"):
 
-- **Tested end-to-end (mocked network):** happy path (all legs fresh, LTH auto-level
-  and auto-direction, true-ratio sparkline, cache written), full-offline path (all
-  four legs degrade to visible "Source down" cards, manual entry recovers), metals
-  chain walking (primary down + secondary shape-broken → token proxy wins), and the
-  stale-LTH warning. Zero JS errors in all runs.
-- **Not tested live (assumed, self-reporting if wrong):** real CORS headers of
-  `gold-api.com`, `data-asg.goldprice.org`, `bitcoin-data.com` /
-  `api.bitcoin-data.com`, and `community-api.coinmetrics.io`, and
-  bitcoin-data.com's exact field names (the parser accepts `lthSupply` /
-  `lth_supply` / `value` / `supply`, string or number, BTC or percent, and
-  tries both hosts because BGeometrics' docs reference `api.bitcoin-data.com`).
-- **Load-bearing by design:** CoinGecko. It anchors the BTC leg, the metals-chain
-  tail (PAXG/KAG proxies, which track spot within ~1%), and history. If a first-choice
-  source turns out to be CORS-blocked in your browser, the chain falls through to the
-  CoinGecko proxy silently and the health card names which source actually won.
+- **Alive and CORS-open (`ACAO: *`):** CoinGecko (markets + PAXG/KAG proxy),
+  `gold-api.com` (XAU and XAG), and `api.bitcoin-data.com` — note the bare
+  `bitcoin-data.com` host serves data but sends **no** CORS header, which is why the
+  `api.` host goes first in the browser chain.
+- **Dead ends found and removed:** `/v1/lth-supply` doesn't exist (the real path is
+  `/v1/long-term-hodler-supply-btc`, found via BGeometrics' OpenAPI spec);
+  CoinMetrics' community tier exposes no active-supply metrics, so it was dropped.
+- **Unreliable:** `data-asg.goldprice.org` returns 403 to non-browser clients; it's
+  kept as a middle chain link only (it may still work from a real browser).
+- **Tested end-to-end in headless Chromium (mocked network):** happy path, full
+  offline (all legs degrade to visible "Source down" cards, manual entry recovers),
+  metals chain walking, LTH snapshot reading, stale-data warning. Zero JS errors.
+- **Load-bearing by design:** CoinGecko (BTC leg, metals tail via PAXG/KAG tokenized
+  proxies tracking spot within ~1%, history) and the weekly Action snapshot for LTH.
 
-If a leg shows red on your first real load, the page itself tells you exactly what to
-ask for — that's the point of it.
+If a leg shows red on a real load, the page itself tells you exactly what to ask
+for — that's the point of it. If the LTH feed dies upstream, the Action run goes red
+and the page's snapshot trips the amber stale warning after 30 days.
 
 ## Caveats encoded in the page
 
