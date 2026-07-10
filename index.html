@@ -289,7 +289,7 @@
 
 <footer>
   <div class="fl">Methodology &amp; honesty</div>
-  BTC price and market cap fetch live from CoinGecko (keyless). Gold and silver caps = spot price × fixed above-ground stock (~6.95 B oz gold, ~56.3 B oz silver); spot comes from a fallback chain — gold-api.com, then goldprice.org, then tokenized-metal proxies (PAXG/KAG) on CoinGecko, which track spot within ~1%. Long-term-holder supply (155-day definition) auto-loads from bitcoin-data.com (BGeometrics); it reproduces the UTXO-age <em>trend</em>, not Glassnode's proprietary entity-adjusted level — read its direction, not its exact level. Last-good values are cached on this device and used, labelled, when a feed is down. Waypoints: 0.05 was the 2017 floor, ~0.15 the 2021 and 2024 peaks, 0.20–0.30 the convergence target. Not investment advice — an instrument for one long thesis you already hold.
+  BTC price and market cap fetch live from CoinGecko (keyless). Gold and silver caps = spot price × fixed above-ground stock (~6.95 B oz gold, ~56.3 B oz silver); spot comes from a fallback chain — gold-api.com, then goldprice.org, then tokenized-metal proxies (PAXG/KAG) on CoinGecko, which track spot within ~1%. Long-term-holder supply (155-day definition) auto-loads from bitcoin-data.com (BGeometrics), falling back to CoinMetrics' 180-day active-supply complement (a close cousin, labelled when in use); either way it reproduces the UTXO-age <em>trend</em>, not Glassnode's proprietary entity-adjusted level — read its direction, not its exact level. Last-good values are cached on this device and used, labelled, when a feed is down. Waypoints: 0.05 was the 2017 floor, ~0.15 the 2021 and 2024 peaks, 0.20–0.30 the convergence target. Not investment advice — an instrument for one long thesis you already hold.
 </footer>
 
 <script>
@@ -510,62 +510,107 @@
     var pct = (v>100) ? (v/S.btcCirc)*100 : v;
     return sane(pct,40,90) ? pct : null;
   }
-  function applyLth(pct, ts, dir, src){
+  function applyLth(pct, ts, dir, src, note){
     S.lthPct = pct;
     if(ts!=null) S.lthTs = ts;
     if(dir) setLthDir(dir);
     var days = (ts!=null) ? (Date.now()-ts)/864e5 : null;
     S.health.lth = (days!=null && days>LTH_STALE_DAYS) ? "stale" : "ok";
-    S.meta.lth = { src:src, ts:Date.now(), dataTs:ts };
+    S.meta.lth = { src:src, ts:Date.now(), dataTs:ts, note:note };
     cacheSave("lth",{pct:pct,dataTs:ts,dir:S.lthDir,src:src,ts:Date.now()});
   }
-  function loadLTH(){
-    // primary: full series (gives level + direction)
-    return getJSON("https://bitcoin-data.com/v1/lth-supply", 15000, 1)
-      .then(function(d){
+  // direction from a series of {v(pct), t(ms)}: latest vs the point nearest 90d back
+  function lthDirFrom(entries, lastPct, lastT){
+    if(lastT==null) return null;
+    var target = lastT - 90*864e5, best=null;
+    for(var i=entries.length-1;i>=0;i--){
+      var e = entries[i];
+      if(!e || e.t==null || e.v==null) continue;
+      if(best==null || Math.abs(e.t-target)<Math.abs(best.t-target)) best=e;
+      if(e.t<target) break;
+    }
+    if(!best) return null;
+    var diff = lastPct - best.v;
+    return diff>0.35 ? "up" : (diff<-0.35 ? "down" : "flat");
+  }
+  // BGeometrics series/last parsers, parameterized by host — their docs live on
+  // api.bitcoin-data.com but the bare host also serves; try both.
+  function srcBgeoSeries(base){
+    return function(){
+      // no per-source retries: the chain itself is the retry
+      return getJSON(base+"/v1/lth-supply", 15000, 0).then(function(d){
         var arr = Array.isArray(d) ? d : (d && Array.isArray(d.data) ? d.data : null);
         if(!arr || arr.length<2) throw new Error("shape");
         var last = lthEntry(arr[arr.length-1]);
         var pct = last && lthToPct(last.v);
         if(pct==null) throw new Error("shape");
-        // direction: compare against the entry nearest 90 days back
-        var dir = null;
-        if(last.t!=null){
-          var target = last.t - 90*864e5, best=null;
-          for(var i=arr.length-1;i>=0;i--){
-            var e = lthEntry(arr[i]);
-            if(!e || e.t==null) continue;
-            if(best==null || Math.abs(e.t-target)<Math.abs(best.t-target)) best=e;
-            if(e.t<target) break;
-          }
-          var prev = best && lthToPct(best.v);
-          if(prev!=null){
-            var diff = pct - prev;
-            dir = diff>0.35 ? "up" : (diff<-0.35 ? "down" : "flat");
-          }
-        }
+        var series = arr.map(function(o){
+          var e = lthEntry(o);
+          return e ? {v:lthToPct(e.v), t:e.t} : null;
+        }).filter(Boolean);
+        var dir = lthDirFrom(series, pct, last.t);
         applyLth(pct, last.t, dir, "bitcoin-data.com");
-      })
-      .catch(function(){
-        // secondary: latest-only endpoint (level, no direction)
-        return getJSON("https://bitcoin-data.com/v1/lth-supply/last", 9000, 1)
-          .then(function(d){
-            var e = lthEntry(d) || lthEntry(d && d.data);
-            var pct = e && lthToPct(e.v);
-            if(pct==null) throw new Error("shape");
-            applyLth(pct, e.t, null, "bitcoin-data.com");
-          });
-      })
-      .catch(function(e){
-        failLeg("lth", e, function(c){
-          var pct = num(c.pct);
-          if(!sane(pct,40,90)) return false;
-          S.lthPct = pct;
-          if(c.dataTs!=null) S.lthTs = c.dataTs;
-          if(c.dir) setLthDir(c.dir);
-          return true;
-        });
       });
+    };
+  }
+  function srcBgeoLast(base){
+    return function(){
+      return getJSON(base+"/v1/lth-supply/last", 9000, 0).then(function(d){
+        var e = lthEntry(d) || lthEntry(d && d.data);
+        var pct = e && lthToPct(e.v);
+        if(pct==null) throw new Error("shape");
+        applyLth(pct, e.t, null, "bitcoin-data.com");
+      });
+    };
+  }
+  // Independent fallback: CoinMetrics community API (keyless). SplyAct180d =
+  // supply active in the past 180 days, so 100 − active% ≈ LTH%. That's a
+  // 180-day window, not the 155-day LTH definition — a close cousin; the
+  // health card says so, and this instrument reads trend, not level.
+  function srcCoinMetrics(){
+    var start = new Date(Date.now()-120*864e5).toISOString().slice(0,10);
+    var url = "https://community-api.coinmetrics.io/v4/timeseries/asset-metrics"+
+      "?assets=btc&metrics=SplyAct180d,SplyCur&frequency=1d&page_size=200&start_time="+start;
+    return getJSON(url, 12000, 1).then(function(d){
+      var rows = d && d.data;
+      if(!Array.isArray(rows) || rows.length<2) throw new Error("shape");
+      var series = rows.map(function(o){
+        var act = num(o.SplyAct180d), cur = num(o.SplyCur);
+        if(act==null || cur==null || cur<=0) return null;
+        var pct = (1-act/cur)*100;
+        var t = Date.parse(o.time);
+        return sane(pct,40,90) ? {v:pct, t:isFinite(t)?t:null} : null;
+      }).filter(Boolean);
+      if(series.length<2) throw new Error("shape");
+      var last = series[series.length-1];
+      var dir = lthDirFrom(series, last.v, last.t);
+      applyLth(last.v, last.t, dir, "CoinMetrics community",
+        "Uses the 180-day active-supply definition — a close cousin of the 155-day LTH; read the trend, not the exact level.");
+    });
+  }
+  function loadLTH(){
+    var chain = [
+      srcBgeoSeries("https://bitcoin-data.com"),
+      srcBgeoSeries("https://api.bitcoin-data.com"),
+      srcBgeoLast("https://bitcoin-data.com"),
+      srcBgeoLast("https://api.bitcoin-data.com"),
+      srcCoinMetrics
+    ];
+    var lastErr = null;
+    function tryNext(i){
+      if(i>=chain.length) return Promise.reject(lastErr||new Error("down"));
+      return chain[i]().catch(function(e){ lastErr=e; return tryNext(i+1); });
+    }
+    return tryNext(0).catch(function(e){
+      failLeg("lth", e, function(c){
+        var pct = num(c.pct);
+        if(!sane(pct,40,90)) return false;
+        S.lthPct = pct;
+        if(c.dataTs!=null) S.lthTs = c.dataTs;
+        if(c.dir) setLthDir(c.dir);
+        return true;
+      });
+    });
   }
   function setLthDir(dir){
     S.lthDir = dir;
@@ -730,7 +775,7 @@
     btc:{ name:"Bitcoin price & market cap", src:"CoinGecko" },
     gold:{ name:"Gold price", src:"metals chain (gold-api.com → goldprice.org → PAXG proxy)" },
     silver:{ name:"Silver price", src:"metals chain (gold-api.com → goldprice.org → KAG proxy)" },
-    lth:{ name:"Long-term holder supply", src:"bitcoin-data.com" }
+    lth:{ name:"Long-term holder supply", src:"LTH chain (bitcoin-data.com → CoinMetrics community)" }
   };
 
   function statusOf(leg){
@@ -739,6 +784,7 @@
       var what = "Pulled live and within range.";
       if(m.proxy) what = "Pulled live via a tokenized-metal proxy (tracks spot within ~1%).";
       if(leg==="lth" && m.dataTs!=null) what += " Data as of "+fmtWhen(m.dataTs)+".";
+      if(m.note) what += " "+m.note;
       return {level:"ok", head:"Fresh", what:what,
         src: m.src ? ("via "+m.src+(m.ts?(" · "+fmtWhen(m.ts)):"")) : null};
     }

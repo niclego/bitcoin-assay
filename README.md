@@ -33,7 +33,7 @@ weekly/monthly thesis cadence.
 | BTC price + market cap | [CoinGecko](https://www.coingecko.com/api) `/coins/markets` (keyless) | localStorage last-good → seed → manual |
 | Gold spot (USD/oz) | [gold-api.com](https://gold-api.com) `XAU` → [goldprice.org](https://goldprice.org) `dbXRates/USD` → CoinGecko **PAXG** tokenized-gold proxy | localStorage last-good → seed → manual |
 | Silver spot (USD/oz) | gold-api.com `XAG` → goldprice.org → CoinGecko **KAG** (Kinesis Silver) proxy | localStorage last-good → seed → manual |
-| Long-term-holder supply % (155-day) | [bitcoin-data.com](https://bitcoin-data.com) (BGeometrics) full series (level + ~90-day direction) → `/lth-supply/last` (level only) | localStorage last-good → manual entry |
+| Long-term-holder supply % (155-day) | [bitcoin-data.com](https://bitcoin-data.com) (BGeometrics) full series (level + ~90-day direction), tried on both `bitcoin-data.com` and `api.bitcoin-data.com` hosts → `/lth-supply/last` (level only) → [CoinMetrics community](https://docs.coinmetrics.io/api/v4/) `SplyAct180d`/`SplyCur` (180-day active-supply complement — close cousin of 155-day LTH, labelled in the health card when in use) | localStorage last-good → manual entry |
 | History sparkline | True ratio: BTC market-cap history ÷ (PAXG price history × fixed stock), both from CoinGecko (≤365 days keyless) | current-cap approximation, with its disclaimer restored |
 
 Gold/silver market caps = spot × fixed above-ground stock (6.952 B oz gold,
@@ -65,9 +65,11 @@ verified, with a real headless Chromium against the real file:
   chain walking (primary down + secondary shape-broken → token proxy wins), and the
   stale-LTH warning. Zero JS errors in all runs.
 - **Not tested live (assumed, self-reporting if wrong):** real CORS headers of
-  `gold-api.com`, `data-asg.goldprice.org`, and `bitcoin-data.com`, and
+  `gold-api.com`, `data-asg.goldprice.org`, `bitcoin-data.com` /
+  `api.bitcoin-data.com`, and `community-api.coinmetrics.io`, and
   bitcoin-data.com's exact field names (the parser accepts `lthSupply` /
-  `lth_supply` / `value` / `supply`, string or number, BTC or percent).
+  `lth_supply` / `value` / `supply`, string or number, BTC or percent, and
+  tries both hosts because BGeometrics' docs reference `api.bitcoin-data.com`).
 - **Load-bearing by design:** CoinGecko. It anchors the BTC leg, the metals-chain
   tail (PAXG/KAG proxies, which track spot within ~1%), and history. If a first-choice
   source turns out to be CORS-blocked in your browser, the chain falls through to the
