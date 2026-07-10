@@ -1,0 +1,860 @@
+<!DOCTYPE html>
+<!--
+  THE ASSAY — hardened build.
+
+  ARCHITECTURE CHOICE (brief §4): pure static single file, fetch-on-load.
+  Every leg has a keyless browser source with a fallback chain, so no proxy,
+  no GitHub Action, no keys. Host on GitHub Pages as-is.
+
+  Data legs and their chains (first sane result wins):
+    BTC price/mcap ... CoinGecko markets  -> localStorage last-good -> seed/manual
+    Gold spot ........ gold-api.com -> goldprice.org -> CoinGecko PAXG proxy
+                       -> localStorage last-good -> seed/manual
+    Silver spot ...... gold-api.com -> goldprice.org -> CoinGecko KAG proxy
+                       -> localStorage last-good -> seed/manual
+    LTH supply % ..... bitcoin-data.com (BGeometrics, 155-day defn) full series
+                       -> /last endpoint -> localStorage last-good -> manual
+    History .......... true ratio (BTC mcap ÷ (PAXG hist price × stock)) when
+                       PAXG history loads; else current-cap approximation with
+                       the honest disclaimer.
+
+  Fix 4 polish: retry with backoff on 429/network errors, per-leg localStorage
+  last-good cache with "last good at" surfacing, AbortController timeouts kept.
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>The Assay — Bitcoin → Digital Gold</title>
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Spectral:ital,wght@0,300;0,500;0,600;1,400&family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+  :root{
+    --ground:#0E1512;
+    --panel:#16201C;
+    --panel-2:#1B2621;
+    --edge:#2A3A33;
+    --ink:#E8E4D8;
+    --muted:#7E8C83;
+    --gold:#C8A44D;
+    --jade:#5F9E7E;
+    --amber:#D9A441;
+    --alert:#C25A4A;
+    --ember:#CC6B3C;
+    --pewter:#9BA8AE;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{-webkit-text-size-adjust:100%}
+  body{
+    background:
+      radial-gradient(120% 80% at 50% -10%, #17221D 0%, var(--ground) 55%) fixed;
+    color:var(--ink);
+    font-family:"IBM Plex Sans",system-ui,sans-serif;
+    line-height:1.5;
+    padding:22px 18px 60px;
+    max-width:560px;
+    margin:0 auto;
+    -webkit-font-smoothing:antialiased;
+  }
+  .eyebrow{
+    font-family:"IBM Plex Sans";
+    font-size:10.5px;font-weight:600;letter-spacing:.28em;
+    text-transform:uppercase;color:var(--muted);
+  }
+  .mono{font-family:"IBM Plex Mono";font-variant-numeric:tabular-nums}
+  .serif{font-family:"Spectral"}
+
+  /* header */
+  header{display:flex;justify-content:space-between;align-items:flex-start;gap:14px;margin-bottom:26px}
+  .wordmark{font-family:"Spectral";font-weight:600;font-size:27px;letter-spacing:.01em;line-height:1}
+  .subhead{color:var(--muted);font-size:12px;margin-top:7px;max-width:230px}
+  .health-chip{
+    display:inline-flex;align-items:center;gap:7px;
+    border:1px solid var(--edge);border-radius:100px;
+    padding:6px 11px;font-size:11px;font-weight:500;white-space:nowrap;
+    cursor:pointer;background:var(--panel);
+  }
+  .dot{width:7px;height:7px;border-radius:50%;flex:0 0 auto}
+  .dot.ok{background:var(--jade);box-shadow:0 0 8px rgba(95,158,126,.6)}
+  .dot.warn{background:var(--amber);box-shadow:0 0 8px rgba(217,164,65,.6)}
+  .dot.bad{background:var(--alert);box-shadow:0 0 8px rgba(194,90,74,.6)}
+
+  /* hero gauge */
+  .hero{
+    border:1px solid var(--edge);border-radius:16px;
+    background:linear-gradient(180deg,var(--panel) 0%,var(--panel-2) 100%);
+    padding:22px 20px 18px;margin-bottom:16px;position:relative;overflow:hidden;
+  }
+  .hero .eyebrow{margin-bottom:14px}
+  .ratio-big{font-family:"IBM Plex Mono";font-weight:600;font-size:52px;line-height:.9;letter-spacing:-.02em}
+  .ratio-cap{color:var(--muted);font-size:12px;margin-top:8px}
+  .ratio-cap b{color:var(--gold);font-weight:600}
+
+  .gauge{margin-top:22px;position:relative;height:64px}
+  .track{position:absolute;top:20px;left:0;right:0;height:5px;border-radius:4px;
+    background:linear-gradient(90deg,#33291a 0%,#4a3c22 45%,#6b5528 100%);
+    border:1px solid rgba(200,164,77,.18)}
+  .wp{position:absolute;top:14px;transform:translateX(-50%);text-align:center}
+  .wp .tick{width:1px;height:17px;background:var(--edge);margin:0 auto}
+  .wp .wl{font-size:9px;color:var(--muted);margin-top:6px;letter-spacing:.04em;white-space:nowrap}
+  .wp .wv{font-family:"IBM Plex Mono";font-size:10px;color:var(--pewter);margin-top:2px}
+  .needle{position:absolute;top:8px;transform:translateX(-50%);transition:left 1.1s cubic-bezier(.22,1,.36,1)}
+  .needle .stem{width:2px;height:30px;background:var(--gold);margin:0 auto;box-shadow:0 0 10px rgba(200,164,77,.8)}
+  .needle .head{width:11px;height:11px;border-radius:50%;background:var(--gold);margin:-3px auto 0;box-shadow:0 0 12px rgba(200,164,77,.9)}
+  .needle .nlabel{font-family:"IBM Plex Mono";font-size:10px;color:var(--gold);margin-top:3px;white-space:nowrap;font-weight:600}
+
+  /* verdict */
+  .verdict{border:1px solid var(--edge);border-radius:16px;background:var(--panel);
+    padding:20px;margin-bottom:16px}
+  .verdict .eyebrow{margin-bottom:10px}
+  .verdict-word{font-family:"Spectral";font-weight:600;font-size:34px;line-height:1;letter-spacing:.01em}
+  .verdict-word.grad{color:var(--jade)}
+  .verdict-word.decay{color:var(--alert)}
+  .verdict-word.amb{color:var(--gold)}
+  .verdict-body{color:var(--ink);font-size:14px;margin-top:12px;opacity:.92}
+  .verdict-body .hl{color:var(--gold);font-weight:500}
+
+  /* metric cards */
+  .section-label{font-family:"IBM Plex Sans";font-size:10.5px;font-weight:600;letter-spacing:.24em;
+    text-transform:uppercase;color:var(--muted);margin:26px 4px 12px}
+  .metric{border:1px solid var(--edge);border-radius:14px;background:var(--panel);
+    padding:16px 16px 15px;margin-bottom:11px}
+  .metric-top{display:flex;justify-content:space-between;align-items:baseline;gap:10px}
+  .metric-name{font-size:13px;font-weight:600;display:flex;align-items:center;gap:8px}
+  .metric-val{font-family:"IBM Plex Mono";font-weight:600;font-size:22px;letter-spacing:-.01em;white-space:nowrap}
+  .metric-why{color:var(--muted);font-size:12px;margin-top:9px;line-height:1.45}
+  .trend{font-family:"IBM Plex Mono";font-size:11px;margin-left:8px;font-weight:500}
+  .trend.up{color:var(--jade)}.trend.down{color:var(--alert)}.trend.flat{color:var(--muted)}
+
+  .minibar{height:4px;border-radius:3px;background:var(--panel-2);margin-top:12px;position:relative;overflow:hidden;border:1px solid var(--edge)}
+  .minibar .fill{position:absolute;top:0;bottom:0;left:0;background:linear-gradient(90deg,#6b5528,var(--gold));border-radius:3px;transition:width 1s ease}
+  .minibar-cap{display:flex;justify-content:space-between;font-size:9px;color:var(--muted);margin-top:5px;font-family:"IBM Plex Mono"}
+
+  /* spark */
+  .spark-wrap{border:1px solid var(--edge);border-radius:14px;background:var(--panel);padding:16px}
+  .spark-head{display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px}
+  svg.spark{width:100%;height:96px;display:block;margin-top:8px}
+  .spark-note{font-size:10.5px;color:var(--muted);margin-top:10px;line-height:1.4}
+
+  /* health / warnings */
+  .warn-card{border-radius:14px;padding:15px 15px 13px;margin-bottom:11px;border:1px solid}
+  .warn-card.warn{border-color:rgba(217,164,65,.4);background:rgba(217,164,65,.07)}
+  .warn-card.bad{border-color:rgba(194,90,74,.42);background:rgba(194,90,74,.08)}
+  .warn-card.ok{border-color:var(--edge);background:var(--panel)}
+  .warn-head{display:flex;align-items:center;gap:9px;font-size:13px;font-weight:600}
+  .warn-what{font-size:12.5px;color:var(--ink);opacity:.9;margin-top:8px;line-height:1.5}
+  .warn-src{font-family:"IBM Plex Mono";font-size:10px;color:var(--muted);margin-top:7px}
+  .tell{margin-top:11px;background:var(--ground);border:1px solid var(--edge);border-radius:9px;
+    padding:10px 11px;font-family:"IBM Plex Mono";font-size:11.5px;color:var(--pewter);line-height:1.5}
+  .copy-btn{margin-top:9px;display:inline-flex;align-items:center;gap:7px;cursor:pointer;
+    background:var(--panel-2);border:1px solid var(--edge);color:var(--ink);
+    border-radius:8px;padding:8px 13px;font-size:11.5px;font-weight:600;font-family:"IBM Plex Sans"}
+  .copy-btn:active{transform:scale(.97)}
+
+  /* inputs */
+  details.inputs{border:1px solid var(--edge);border-radius:14px;background:var(--panel);margin-top:12px;overflow:hidden}
+  details.inputs summary{list-style:none;cursor:pointer;padding:15px 16px;font-size:12.5px;font-weight:600;
+    display:flex;justify-content:space-between;align-items:center}
+  details.inputs summary::-webkit-details-marker{display:none}
+  .chev{color:var(--muted);transition:transform .2s}
+  details[open] .chev{transform:rotate(180deg)}
+  .input-body{padding:2px 16px 18px;border-top:1px solid var(--edge)}
+  .field{margin-top:15px}
+  .field label{display:block;font-size:11.5px;color:var(--muted);margin-bottom:7px}
+  .field label b{color:var(--ink);font-weight:600}
+  .field input[type=number]{width:100%;background:var(--ground);border:1px solid var(--edge);
+    border-radius:9px;padding:11px 12px;color:var(--ink);font-family:"IBM Plex Mono";font-size:15px}
+  .field input:focus{outline:none;border-color:var(--gold)}
+  .seg{display:flex;gap:6px;margin-top:7px}
+  .seg button{flex:1;background:var(--ground);border:1px solid var(--edge);color:var(--muted);
+    border-radius:9px;padding:10px 6px;font-size:12px;font-weight:600;cursor:pointer;font-family:"IBM Plex Sans"}
+  .seg button.on{color:var(--ink);border-color:var(--gold);background:rgba(200,164,77,.1)}
+  .apply{margin-top:16px;width:100%;background:var(--gold);color:#1a1408;border:none;border-radius:10px;
+    padding:13px;font-size:13px;font-weight:600;cursor:pointer;font-family:"IBM Plex Sans"}
+  .apply:active{transform:scale(.99)}
+
+  footer{margin-top:28px;color:var(--muted);font-size:10.5px;line-height:1.6}
+  footer .fl{font-family:"IBM Plex Sans";font-weight:600;letter-spacing:.14em;text-transform:uppercase;
+    font-size:9.5px;color:var(--edge);margin-bottom:8px}
+  @media (prefers-reduced-motion:reduce){*{transition:none!important}}
+</style>
+</head>
+<body>
+
+<header>
+  <div>
+    <div class="wordmark">The&nbsp;Assay</div>
+    <div class="subhead">Is Bitcoin graduating into digital gold? A convergence instrument for the long thesis.</div>
+  </div>
+  <div class="health-chip" id="globalHealth" onclick="document.getElementById('health').scrollIntoView({behavior:'smooth'})">
+    <span class="dot ok" id="ghDot"></span><span id="ghText">checking…</span>
+  </div>
+</header>
+
+<!-- HERO GAUGE -->
+<div class="hero">
+  <div class="eyebrow">The pie slice · BTC ÷ Gold market cap</div>
+  <div class="ratio-big mono" id="heroRatio">0.043</div>
+  <div class="ratio-cap">Bitcoin is <b id="heroPct">4.3%</b> the size of gold. The digital-gold thesis is a multi-year climb up this track.</div>
+  <div class="gauge" id="gauge">
+    <div class="track"></div>
+    <!-- waypoints injected -->
+    <div class="needle" id="needle" style="left:14%">
+      <div class="stem"></div><div class="head"></div>
+      <div class="nlabel" id="needleLabel">now</div>
+    </div>
+  </div>
+</div>
+
+<!-- VERDICT -->
+<div class="verdict">
+  <div class="eyebrow">The read · graduation vs decay</div>
+  <div class="verdict-word amb" id="verdictWord">Reading…</div>
+  <div class="verdict-body" id="verdictBody">Pulling the numbers together.</div>
+</div>
+
+<!-- METRICS -->
+<div class="section-label">The three signals</div>
+
+<div class="metric" id="m_slice">
+  <div class="metric-top">
+    <div class="metric-name"><span class="dot ok" id="d_slice"></span>Pie slice — BTC ÷ Gold</div>
+    <div class="metric-val" id="v_slice">0.043 <span class="trend flat" id="t_slice">→</span></div>
+  </div>
+  <div class="minibar"><div class="fill" id="bar_slice" style="width:14%"></div></div>
+  <div class="minibar-cap"><span>0.05 · 2017 floor</span><span>0.15 · past peaks</span><span>0.30 · target</span></div>
+  <div class="metric-why">Bitcoin's share of the pure monetary-reserve asset. Rising = it's winning gold's role. This is the headline thesis line.</div>
+</div>
+
+<div class="metric" id="m_basket">
+  <div class="metric-top">
+    <div class="metric-name"><span class="dot ok" id="d_basket"></span>Breadth — BTC ÷ (Gold + Silver)</div>
+    <div class="metric-val" id="v_basket">0.039</div>
+  </div>
+  <div class="metric-why">Same idea against the wider hard-asset basket. A cross-check, not the main test — silver carries industrial-demand noise, so read it second.</div>
+</div>
+
+<div class="metric" id="m_lth">
+  <div class="metric-top">
+    <div class="metric-name"><span class="dot warn" id="d_lth"></span>Maturation — long-term holder supply</div>
+    <div class="metric-val" id="v_lth">74% <span class="trend flat" id="t_lth">→</span></div>
+  </div>
+  <div class="metric-why" id="why_lth">Share of coins held &gt;155 days. This is the tiebreaker: a rising holder base under a falling slice means growing pains; a falling base means decay.</div>
+</div>
+
+<!-- HISTORY -->
+<div class="section-label">Where we've been</div>
+<div class="spark-wrap">
+  <div class="spark-head">
+    <div style="font-size:12.5px;font-weight:600" id="sparkTitle">Pie slice · ~1 year</div>
+    <div class="mono" id="sparkNow" style="font-size:12px;color:var(--gold)">—</div>
+  </div>
+  <svg class="spark" id="spark" viewBox="0 0 320 96" preserveAspectRatio="none" aria-hidden="true"></svg>
+  <div class="spark-note" id="sparkNote">History traces Bitcoin's market cap against today's metals cap. Since Bitcoin swings ~20× harder than gold, the shape is overwhelmingly Bitcoin's move — a fair approximation for a glance, not a precise historical ratio.</div>
+</div>
+
+<!-- HEALTH -->
+<div class="section-label" id="health">Source health</div>
+<div id="warnings"></div>
+
+<!-- INPUTS -->
+<details class="inputs">
+  <summary><span>Set values manually</span><span class="chev">▾</span></summary>
+  <div class="input-body">
+    <div class="field">
+      <label><b>Gold</b> spot price (USD / oz)</label>
+      <input type="number" id="in_gold" step="1" />
+    </div>
+    <div class="field">
+      <label><b>Silver</b> spot price (USD / oz)</label>
+      <input type="number" id="in_silver" step="0.1" />
+    </div>
+    <div class="field">
+      <label><b>Long-term holder</b> supply (% of circulating)</label>
+      <input type="number" id="in_lth" step="0.1" />
+      <div style="font-size:10.5px;color:var(--muted);margin-top:7px">Auto-fills from bitcoin-data.com. Override here if that feed is down — read the current figure free from CoinGlass or hodlwave.</div>
+    </div>
+    <div class="field">
+      <label><b>Holder base</b> direction (this quarter)</label>
+      <div class="seg" id="seg_dir">
+        <button data-dir="up">Thickening</button>
+        <button data-dir="flat" class="on">Flat</button>
+        <button data-dir="down">Thinning</button>
+      </div>
+    </div>
+    <button class="apply" id="applyBtn">Apply &amp; recompute</button>
+  </div>
+</details>
+
+<footer>
+  <div class="fl">Methodology &amp; honesty</div>
+  BTC price and market cap fetch live from CoinGecko (keyless). Gold and silver caps = spot price × fixed above-ground stock (~6.95 B oz gold, ~56.3 B oz silver); spot comes from a fallback chain — gold-api.com, then goldprice.org, then tokenized-metal proxies (PAXG/KAG) on CoinGecko, which track spot within ~1%. Long-term-holder supply (155-day definition) auto-loads from bitcoin-data.com (BGeometrics); it reproduces the UTXO-age <em>trend</em>, not Glassnode's proprietary entity-adjusted level — read its direction, not its exact level. Last-good values are cached on this device and used, labelled, when a feed is down. Waypoints: 0.05 was the 2017 floor, ~0.15 the 2021 and 2024 peaks, 0.20–0.30 the convergence target. Not investment advice — an instrument for one long thesis you already hold.
+</footer>
+
+<script>
+(function(){
+  "use strict";
+
+  // ---- fixed constants ----
+  var GOLD_OZ = 6.952e9;      // above-ground gold, troy oz
+  var SILVER_OZ = 5.629e10;   // above-ground silver, troy oz
+  var WAYPOINTS = [
+    {v:0.05, label:"2017 floor"},
+    {v:0.15, label:"past peaks"},
+    {v:0.30, label:"target"}
+  ];
+  var GMAX = 0.32;            // gauge max
+  var LS_PREFIX = "assay.v2.";
+  var LTH_STALE_DAYS = 30;
+  var CIRC_FALLBACK = 19.9e6; // BTC circulating, only if CoinGecko leg is down
+
+  // ---- seed state (clearly provisional until confirmed) ----
+  var S = {
+    btcPrice: 61000, btcMcap: 1.24e12, btcYr: null,   // btcYr = 1y % change
+    btcCirc: CIRC_FALLBACK,
+    goldPx: 4100, silverPx: 59,
+    lthPct: 74, lthDir: "flat", lthTs: null,          // lthTs = data timestamp (ms)
+    health: { btc:"seed", gold:"seed", silver:"seed", lth:"seed" },
+    // per-leg provenance: which source won, when, and failure reason if cached
+    meta: { btc:{}, gold:{}, silver:{}, lth:{} },
+    history: null,      // [[ts, btcMcap], ...]
+    histRatio: null     // [{t, r}] true ratio series when metals history loaded
+  };
+
+  var $ = function(id){return document.getElementById(id);};
+  var fmt = function(n,d){return Number(n).toFixed(d==null?2:d);};
+
+  // ---- localStorage last-good cache (Fix 4) ----
+  function cacheSave(leg, obj){
+    try{ localStorage.setItem(LS_PREFIX+leg, JSON.stringify(obj)); }catch(e){}
+  }
+  function cacheLoad(leg){
+    try{
+      var raw = localStorage.getItem(LS_PREFIX+leg);
+      return raw ? JSON.parse(raw) : null;
+    }catch(e){ return null; }
+  }
+  function fmtWhen(ts){
+    try{
+      var d = new Date(ts);
+      return d.toLocaleDateString(undefined,{month:"short",day:"numeric"})+" "+
+             d.toLocaleTimeString(undefined,{hour:"2-digit",minute:"2-digit"});
+    }catch(e){ return "unknown time"; }
+  }
+
+  // ---- fetch helpers: timeout + retry-with-backoff on 429/network (Fix 4) ----
+  function fetchOnce(url, ms){
+    var ctrl = new AbortController();
+    var t = setTimeout(function(){ctrl.abort();}, ms);
+    return fetch(url,{signal:ctrl.signal,headers:{accept:"application/json"}})
+      .then(function(r){
+        clearTimeout(t);
+        if(!r.ok){ var e=new Error("HTTP "+r.status); e.status=r.status; throw e; }
+        return r.json();
+      })
+      .catch(function(e){ clearTimeout(t); throw e; });
+  }
+  function getJSON(url, ms, retries){
+    ms = ms||9000;
+    var delays = [1500, 4000];
+    var left = (retries==null) ? 2 : retries;
+    function attempt(){
+      return fetchOnce(url, ms).catch(function(e){
+        // retry on rate-limit or network/timeout; not on other HTTP errors
+        var retriable = (e.status===429) || (e.status==null);
+        if(retriable && left>0){
+          var d = delays[delays.length-left] || 4000;
+          left--;
+          return new Promise(function(res){setTimeout(res,d);}).then(attempt);
+        }
+        throw e;
+      });
+    }
+    return attempt();
+  }
+
+  // ---- sanity ranges ----
+  function sane(v,lo,hi){ return typeof v==="number" && isFinite(v) && v>=lo && v<=hi; }
+  function num(v){ var n = (typeof v==="string") ? parseFloat(v) : v; return (typeof n==="number"&&isFinite(n))?n:null; }
+
+  // record a failure: use last-good cache if present, else down/changed
+  function failLeg(leg, e, applyCache){
+    var reason = (e && e.message==="shape") ? "changed" : "down";
+    var c = cacheLoad(leg);
+    if(c && applyCache && applyCache(c)){
+      S.health[leg] = "cached";
+      S.meta[leg] = { src:c.src||"cache", ts:c.ts, reason:reason };
+    } else {
+      S.health[leg] = reason;
+      S.meta[leg] = { reason:reason };
+    }
+  }
+
+  // ---- BTC leg (CoinGecko, keyless) ----
+  function loadBTC(){
+    var mkt = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&ids=bitcoin&price_change_percentage=1y";
+    return getJSON(mkt).then(function(a){
+      var c = a && a[0];
+      if(!c || !sane(c.current_price,1000,1000000) || !sane(c.market_cap,1e10,1e14))
+        throw new Error("shape");
+      S.btcPrice = c.current_price;
+      S.btcMcap = c.market_cap;
+      if(sane(c.circulating_supply,18e6,21e6)) S.btcCirc = c.circulating_supply;
+      S.btcYr = (typeof c.price_change_percentage_1y_in_currency==="number")
+        ? c.price_change_percentage_1y_in_currency : null;
+      S.health.btc = "ok";
+      S.meta.btc = { src:"CoinGecko", ts:Date.now() };
+      cacheSave("btc",{price:S.btcPrice,mcap:S.btcMcap,circ:S.btcCirc,yr:S.btcYr,src:"CoinGecko",ts:Date.now()});
+    }).catch(function(e){
+      failLeg("btc", e, function(c){
+        if(!sane(num(c.price),1000,1000000) || !sane(num(c.mcap),1e10,1e14)) return false;
+        S.btcPrice=num(c.price); S.btcMcap=num(c.mcap);
+        if(sane(num(c.circ),18e6,21e6)) S.btcCirc=num(c.circ);
+        if(typeof c.yr==="number") S.btcYr=c.yr;
+        return true;
+      });
+    });
+  }
+
+  // ---- metals leg: fallback chain (Fix 1) ----
+  // Each source resolves {gold, silver} with any subset present; first sane
+  // value per metal wins. Chain: gold-api.com -> goldprice.org -> CoinGecko
+  // tokenized proxies (PAXG ~1oz gold, KAG ~1oz silver).
+  var METAL_SANE = { gold:[500,20000], silver:[2,500] };
+
+  function srcGoldApi(){
+    function one(sym){
+      return getJSON("https://api.gold-api.com/price/"+sym, 7000, 1)
+        .then(function(d){ return num(d && (d.price!=null?d.price:d.rate)); });
+    }
+    return Promise.all([
+      one("XAU").catch(function(){return null;}),
+      one("XAG").catch(function(){return null;})
+    ]).then(function(r){
+      if(r[0]==null && r[1]==null) throw new Error("down");
+      return {gold:r[0], silver:r[1], name:"gold-api.com"};
+    });
+  }
+  function srcGoldpriceOrg(){
+    return getJSON("https://data-asg.goldprice.org/dbXRates/USD", 7000, 1)
+      .then(function(d){
+        var it = d && d.items && d.items[0];
+        if(!it) throw new Error("shape");
+        return {gold:num(it.xauPrice), silver:num(it.xagPrice), name:"goldprice.org"};
+      });
+  }
+  function srcTokenProxy(){
+    return getJSON("https://api.coingecko.com/api/v3/simple/price?ids=pax-gold,kinesis-silver&vs_currencies=usd", 9000)
+      .then(function(d){
+        var g = d && d["pax-gold"] && num(d["pax-gold"].usd);
+        var s = d && d["kinesis-silver"] && num(d["kinesis-silver"].usd);
+        if(g==null && s==null) throw new Error("shape");
+        return {gold:g, silver:s, name:"CoinGecko token proxy (PAXG/KAG)", proxy:true};
+      });
+  }
+
+  function loadMetals(){
+    var chain = [srcGoldApi, srcGoldpriceOrg, srcTokenProxy];
+    var got = {gold:false, silver:false};
+    var sawResponse = false;
+
+    function tryNext(i){
+      if(i>=chain.length || (got.gold && got.silver)) return Promise.resolve();
+      return chain[i]().then(function(r){
+        sawResponse = true;
+        ["gold","silver"].forEach(function(m){
+          if(got[m]) return;
+          var v = r[m], rng = METAL_SANE[m];
+          if(v!=null && sane(v, rng[0], rng[1])){
+            if(m==="gold") S.goldPx=v; else S.silverPx=v;
+            got[m]=true;
+            S.health[m]="ok";
+            S.meta[m]={src:r.name, ts:Date.now(), proxy:!!r.proxy};
+            cacheSave(m,{px:v,src:r.name,ts:Date.now()});
+          }
+        });
+      }).catch(function(){ /* source down or unparseable — walk the chain */ })
+        .then(function(){ return tryNext(i+1); });
+    }
+
+    return tryNext(0).then(function(){
+      ["gold","silver"].forEach(function(m){
+        if(got[m]) return;
+        // whole chain failed for this metal: last-good cache, else down/changed
+        failLeg(m, new Error(sawResponse?"shape":"down"), function(c){
+          var rng = METAL_SANE[m], v = num(c.px);
+          if(!sane(v,rng[0],rng[1])) return false;
+          if(m==="gold") S.goldPx=v; else S.silverPx=v;
+          return true;
+        });
+      });
+    });
+  }
+
+  // ---- LTH leg (Fix 2, lightweight path): bitcoin-data.com / BGeometrics ----
+  // Free, keyless, 155-day definition. Returns supply in BTC (or %, handled
+  // either way). Full series lets us derive the ~90-day direction too.
+  function lthEntry(o){
+    if(!o || typeof o!=="object") return null;
+    var v = num(o.lthSupply!=null?o.lthSupply : o.lth_supply!=null?o.lth_supply : o.value!=null?o.value : o.supply);
+    if(v==null) return null;
+    var t = null;
+    var d = o.d||o.date||o.day||o.theDay;
+    if(d){ var p=Date.parse(d); if(isFinite(p)) t=p; }
+    if(t==null){ var u=num(o.unixTs!=null?o.unixTs:o.timestamp); if(u!=null) t = u>1e12?u:u*1000; }
+    return {v:v, t:t};
+  }
+  function lthToPct(v){
+    // values >100 are BTC amounts; convert via circulating supply
+    var pct = (v>100) ? (v/S.btcCirc)*100 : v;
+    return sane(pct,40,90) ? pct : null;
+  }
+  function applyLth(pct, ts, dir, src){
+    S.lthPct = pct;
+    if(ts!=null) S.lthTs = ts;
+    if(dir) setLthDir(dir);
+    var days = (ts!=null) ? (Date.now()-ts)/864e5 : null;
+    S.health.lth = (days!=null && days>LTH_STALE_DAYS) ? "stale" : "ok";
+    S.meta.lth = { src:src, ts:Date.now(), dataTs:ts };
+    cacheSave("lth",{pct:pct,dataTs:ts,dir:S.lthDir,src:src,ts:Date.now()});
+  }
+  function loadLTH(){
+    // primary: full series (gives level + direction)
+    return getJSON("https://bitcoin-data.com/v1/lth-supply", 15000, 1)
+      .then(function(d){
+        var arr = Array.isArray(d) ? d : (d && Array.isArray(d.data) ? d.data : null);
+        if(!arr || arr.length<2) throw new Error("shape");
+        var last = lthEntry(arr[arr.length-1]);
+        var pct = last && lthToPct(last.v);
+        if(pct==null) throw new Error("shape");
+        // direction: compare against the entry nearest 90 days back
+        var dir = null;
+        if(last.t!=null){
+          var target = last.t - 90*864e5, best=null;
+          for(var i=arr.length-1;i>=0;i--){
+            var e = lthEntry(arr[i]);
+            if(!e || e.t==null) continue;
+            if(best==null || Math.abs(e.t-target)<Math.abs(best.t-target)) best=e;
+            if(e.t<target) break;
+          }
+          var prev = best && lthToPct(best.v);
+          if(prev!=null){
+            var diff = pct - prev;
+            dir = diff>0.35 ? "up" : (diff<-0.35 ? "down" : "flat");
+          }
+        }
+        applyLth(pct, last.t, dir, "bitcoin-data.com");
+      })
+      .catch(function(){
+        // secondary: latest-only endpoint (level, no direction)
+        return getJSON("https://bitcoin-data.com/v1/lth-supply/last", 9000, 1)
+          .then(function(d){
+            var e = lthEntry(d) || lthEntry(d && d.data);
+            var pct = e && lthToPct(e.v);
+            if(pct==null) throw new Error("shape");
+            applyLth(pct, e.t, null, "bitcoin-data.com");
+          });
+      })
+      .catch(function(e){
+        failLeg("lth", e, function(c){
+          var pct = num(c.pct);
+          if(!sane(pct,40,90)) return false;
+          S.lthPct = pct;
+          if(c.dataTs!=null) S.lthTs = c.dataTs;
+          if(c.dir) setLthDir(c.dir);
+          return true;
+        });
+      });
+  }
+  function setLthDir(dir){
+    S.lthDir = dir;
+    Array.prototype.forEach.call($("seg_dir").querySelectorAll("button"),function(b){
+      b.classList.toggle("on", b.getAttribute("data-dir")===dir);
+    });
+  }
+
+  // ---- history (Fix 3): true ratio when PAXG history loads ----
+  function loadHistory(){
+    // keyless CoinGecko is limited to the past 365 days of history
+    var btcUrl = "https://api.coingecko.com/api/v3/coins/bitcoin/market_chart?vs_currency=usd&days=365";
+    var paxgUrl = "https://api.coingecko.com/api/v3/coins/pax-gold/market_chart?vs_currency=usd&days=365";
+    var dayKey = function(ts){ return Math.round(ts/864e5); };
+    return getJSON(btcUrl,12000).then(function(d){
+      if(!(d && d.market_caps && d.market_caps.length>10)) return;
+      S.history = d.market_caps;
+      return getJSON(paxgUrl,12000).then(function(p){
+        if(!(p && p.prices && p.prices.length>10)) return;
+        var goldByDay = {};
+        p.prices.forEach(function(row){
+          var px = num(row[1]);
+          if(px!=null && sane(px,METAL_SANE.gold[0],METAL_SANE.gold[1]))
+            goldByDay[dayKey(row[0])] = px;
+        });
+        var out = [], misses = 0;
+        S.history.forEach(function(row){
+          var g = goldByDay[dayKey(row[0])] || goldByDay[dayKey(row[0])-1];
+          if(g!=null) out.push({t:row[0], r:row[1]/(g*GOLD_OZ)});
+          else misses++;
+        });
+        // require decent alignment before claiming a "true" ratio
+        if(out.length>10 && misses/S.history.length<0.2) S.histRatio = out;
+      }).catch(function(){ /* PAXG history optional; approx fallback below */ });
+    }).catch(function(){ /* history is optional; no warning */ });
+  }
+
+  // ---- derived ----
+  function goldCap(){ return S.goldPx * GOLD_OZ; }
+  function silverCap(){ return S.silverPx * SILVER_OZ; }
+  function sliceRatio(){ return S.btcMcap / goldCap(); }
+  function basketRatio(){ return S.btcMcap / (goldCap()+silverCap()); }
+  function ratioTrend(){
+    if(typeof S.btcYr==="number"){ return S.btcYr>3?"up":(S.btcYr<-3?"down":"flat"); }
+    return "flat";
+  }
+
+  // ---- rendering ----
+  function pos(v){ return Math.max(2, Math.min(98, (v/GMAX)*100)); }
+
+  function renderGauge(){
+    var g = $("gauge");
+    WAYPOINTS.forEach(function(w){
+      var el = document.createElement("div");
+      el.className="wp"; el.style.left = pos(w.v)+"%";
+      el.innerHTML = '<div class="tick"></div><div class="wl">'+w.label+'</div><div class="wv">'+w.v.toFixed(2)+'</div>';
+      g.insertBefore(el, $("needle"));
+    });
+  }
+
+  function trendGlyph(t){ return t==="up"?"↑":(t==="down"?"↓":"→"); }
+
+  function render(){
+    var r = sliceRatio(), b = basketRatio(), tr = ratioTrend();
+
+    // hero
+    $("heroRatio").textContent = fmt(r,3);
+    $("heroPct").textContent = fmt(r*100,1)+"%";
+    var np = pos(r);
+    $("needle").style.left = np+"%";
+    $("needleLabel").textContent = fmt(r,3);
+
+    // metric: slice
+    $("v_slice").innerHTML = fmt(r,3)+' <span class="trend '+tr+'">'+trendGlyph(tr)+'</span>';
+    $("bar_slice").style.width = Math.min(100,(r/GMAX)*100)+"%";
+    // metric: basket
+    $("v_basket").textContent = fmt(b,3);
+    // metric: lth
+    var ld = S.lthDir;
+    $("v_lth").innerHTML = fmt(S.lthPct,1)+'% <span class="trend '+ld+'">'+trendGlyph(ld)+'</span>';
+
+    // dots on cards
+    var okish = function(s){ return s==="ok"||s==="stale"||s==="cached"; };
+    setDot("d_slice", (okish(S.health.gold)&&okish(S.health.btc)) ? (S.health.gold==="ok"&&S.health.btc==="ok"?"ok":"warn") : "bad");
+    setDot("d_basket", (S.health.gold==="ok"&&S.health.silver==="ok"&&S.health.btc==="ok")?"ok":"warn");
+    setDot("d_lth", S.health.lth==="ok" ? "ok" : "warn");
+
+    renderVerdict(r, tr);
+    renderSpark();
+    renderHealth();
+  }
+
+  function setDot(id, cls){ var el=$(id); if(el) el.className = "dot "+cls; }
+
+  function renderVerdict(r, tr){
+    var w = $("verdictWord"), body = $("verdictBody");
+    var up = tr==="up", down = tr==="down";
+    var lthUp = S.lthDir==="up", lthDown = S.lthDir==="down";
+    var word, cls, text;
+
+    if(up && lthUp){
+      word="Graduating"; cls="grad";
+      text="The slice is <span class='hl'>expanding</span> and the holder base is <span class='hl'>thickening</span> together. That's the handoff the thesis needs — trader capital converting to allocator capital. Keep watching that both hold.";
+    } else if(down && lthDown){
+      word="Decaying"; cls="decay";
+      text="The slice is <span class='hl'>contracting</span> and the holder base is <span class='hl'>thinning</span> at the same time. That's the pattern to respect — interest leaving faster than conviction arrives. This is the read that should worry you, not a drawdown alone.";
+    } else if(down && lthUp){
+      word="Growing pains"; cls="amb";
+      text="The slice is <span class='hl'>down</span> but the holder base is <span class='hl'>thickening</span>. Price-sensitive holders are leaving while conviction holders stay — falling ratio with a strengthening base reads as maturation under pressure, not decay. The thesis-supporting case.";
+    } else {
+      word="Ambiguous"; cls="amb";
+      text="The signals aren't aligned yet. Remember the trap: a calm ratio can mean graduation <span class='hl'>or</span> decay. Watch whether the slice and the holder base move <span class='hl'>together</span> — that agreement is what turns noise into signal.";
+    }
+    if(r < 0.05){
+      text += " Note: the slice sits <span class='hl'>below its 2017 floor</span> right now — the drawdown has it near the bottom of its historic band.";
+    }
+    w.textContent = word; w.className = "verdict-word "+cls;
+    body.innerHTML = text;
+  }
+
+  function renderSpark(){
+    var svg = $("spark");
+    var pts, note;
+    if(S.histRatio && S.histRatio.length>10){
+      pts = S.histRatio.map(function(e){return e.r;});
+      note = "True historical ratio: each day's BTC market cap ÷ that day's gold cap (PAXG spot × fixed stock). Exact shape, ~1 year (keyless history limit).";
+      $("sparkTitle").textContent = "Pie slice · ~1 year";
+    } else if(S.history && S.history.length>10){
+      var gc = goldCap();
+      pts = S.history.map(function(row){ return row[1]/gc; });
+      note = "History traces Bitcoin's market cap against today's metals cap. Since Bitcoin swings ~20× harder than gold, the shape is overwhelmingly Bitcoin's move — a fair approximation for a glance, not a precise historical ratio.";
+      $("sparkTitle").textContent = "Pie slice · ~1 year (approx)";
+    } else {
+      $("sparkNow").textContent = fmt(sliceRatio(),3);
+      svg.innerHTML = '<text x="160" y="52" fill="#7E8C83" font-size="11" text-anchor="middle" font-family="IBM Plex Mono">live history unavailable</text>';
+      return;
+    }
+    $("sparkNote").textContent = note;
+    var min = Math.min.apply(null,pts), max = Math.max.apply(null,pts);
+    var pad = (max-min)*0.12 || 0.001;
+    min-=pad; max+=pad;
+    var W=320,H=96;
+    var d = pts.map(function(v,i){
+      var x = (i/(pts.length-1))*W;
+      var y = H - ((v-min)/(max-min))*H;
+      return (i?"L":"M")+x.toFixed(1)+" "+y.toFixed(1);
+    }).join(" ");
+    var lastX=W, lastY=H-((pts[pts.length-1]-min)/(max-min))*H;
+    var area = d+" L"+W+" "+H+" L0 "+H+" Z";
+    svg.innerHTML =
+      '<defs><linearGradient id="sg" x1="0" y1="0" x2="0" y2="1">'+
+      '<stop offset="0%" stop-color="#C8A44D" stop-opacity="0.28"/>'+
+      '<stop offset="100%" stop-color="#C8A44D" stop-opacity="0"/></linearGradient></defs>'+
+      '<path d="'+area+'" fill="url(#sg)"/>'+
+      '<path d="'+d+'" fill="none" stroke="#C8A44D" stroke-width="1.8" stroke-linejoin="round"/>'+
+      '<circle cx="'+lastX.toFixed(1)+'" cy="'+lastY.toFixed(1)+'" r="3" fill="#C8A44D"/>';
+    $("sparkNow").textContent = fmt(pts[pts.length-1],3);
+  }
+
+  // ---- health warnings ----
+  var LEG_META = {
+    btc:{ name:"Bitcoin price & market cap", src:"CoinGecko" },
+    gold:{ name:"Gold price", src:"metals chain (gold-api.com → goldprice.org → PAXG proxy)" },
+    silver:{ name:"Silver price", src:"metals chain (gold-api.com → goldprice.org → KAG proxy)" },
+    lth:{ name:"Long-term holder supply", src:"bitcoin-data.com" }
+  };
+
+  function statusOf(leg){
+    var s = S.health[leg], m = S.meta[leg]||{};
+    if(s==="ok"){
+      var what = "Pulled live and within range.";
+      if(m.proxy) what = "Pulled live via a tokenized-metal proxy (tracks spot within ~1%).";
+      if(leg==="lth" && m.dataTs!=null) what += " Data as of "+fmtWhen(m.dataTs)+".";
+      return {level:"ok", head:"Fresh", what:what,
+        src: m.src ? ("via "+m.src+(m.ts?(" · "+fmtWhen(m.ts)):"")) : null};
+    }
+    if(s==="cached") return {level:"warn", head:"Cached — last good",
+      what:LEG_META[leg].name+" failed to load live ("+(m.reason==="changed"?"the feed responded but no longer parses":"every source in the chain was unreachable")+"). Showing the last good value saved on this device"+(m.ts?(" at "+fmtWhen(m.ts)):"")+".",
+      src: m.src ? ("last good via "+m.src) : null,
+      tell:"The "+leg+" leg in The Assay is running on a cached value — the live chain failed. Tell Claude: “the "+leg+" sources in The Assay are failing — check the fallback chain or add a new source.”"};
+    if(s==="stale") return {level:"warn", head:"Stale data",
+      what:LEG_META[leg].name+" loaded, but the newest data point is more than "+LTH_STALE_DAYS+" days old"+(S.lthTs?(" (as of "+fmtWhen(S.lthTs)+")"):"")+". The source may have stopped updating — confirm against a current chart before trusting the trend.",
+      tell:"The "+leg+" feed in The Assay ("+(m.src||LEG_META[leg].src)+") is serving data older than "+LTH_STALE_DAYS+" days. Tell Claude: “the "+leg+" source looks abandoned — swap it or wire an alternative.”"};
+    if(s==="down") return {level:"bad", head:"Source down",
+      what:LEG_META[leg].name+" didn't load — the "+LEG_META[leg].src+" endpoint(s) were unreachable (offline, rate-limited, or CORS-blocked in the browser), and no cached value was available. Showing the seed value instead; set it manually below.",
+      tell:"The "+leg+" auto-fetch ("+LEG_META[leg].src+") is failing to load. Tell Claude: “the "+leg+" data source in The Assay is down — wire a working keyless source or add a retry.”"};
+    if(s==="changed") return {level:"bad", head:"Format changed",
+      what:LEG_META[leg].name+" responded, but the value didn't parse or fell outside a sane range — the feed likely changed its response shape. Showing the seed value; set it manually below.",
+      tell:"The "+leg+" source ("+LEG_META[leg].src+") responded but the data no longer parses. Tell Claude: “the "+leg+" feed in The Assay changed its format — please fix the parser.”"};
+    if(s==="manual") return {level:"warn", head:"Set by hand",
+      what:"This value was entered manually this session, not pulled from a live feed. The page trusts it — confirm it against a current free chart occasionally so the read stays trustworthy.",
+      tell:"I'm entering the "+leg+" value by hand in The Assay. Tell Claude: “the "+leg+" auto-source isn't cutting it — wire a better keyless source so I stop entering it manually.”"};
+    // seed
+    return {level:"warn", head:"Unverified seed",
+      what:LEG_META[leg].name+" is showing a built-in placeholder because the live fetch hasn't confirmed yet. If this persists, the source isn't reaching your browser.",
+      tell:"The "+leg+" leg in The Assay is stuck on its seed value. Tell Claude: “the "+leg+" source never confirms — check the endpoint or swap it.”"};
+  }
+
+  function renderHealth(){
+    var box = $("warnings"); box.innerHTML="";
+    var order = ["btc","gold","silver","lth"];
+    var bad=0, warn=0;
+    order.forEach(function(leg){
+      var st = statusOf(leg);
+      if(st.level==="bad") bad++; else if(st.level==="warn") warn++;
+      var card = document.createElement("div");
+      card.className = "warn-card "+st.level;
+      var dotCls = st.level==="ok"?"ok":(st.level==="warn"?"warn":"bad");
+      var html = '<div class="warn-head"><span class="dot '+dotCls+'"></span>'+
+                 LEG_META[leg].name+' — '+st.head+'</div>'+
+                 '<div class="warn-what">'+st.what+'</div>';
+      if(st.src){
+        html += '<div class="warn-src">'+st.src+'</div>';
+      }
+      if(st.tell){
+        var tid = "tell_"+leg;
+        html += '<div class="tell" id="'+tid+'">'+st.tell+'</div>'+
+                '<button class="copy-btn" data-copy="'+tid+'">Copy fix message</button>';
+      }
+      card.innerHTML = html;
+      box.appendChild(card);
+    });
+
+    // global chip
+    var gd=$("ghDot"), gt=$("ghText");
+    if(bad>0){ gd.className="dot bad"; gt.textContent=bad+" source"+(bad>1?"s":"")+" down"; }
+    else if(warn>0){ gd.className="dot warn"; gt.textContent=warn+" to confirm"; }
+    else { gd.className="dot ok"; gt.textContent="all fresh"; }
+
+    // wire copy buttons
+    Array.prototype.forEach.call(box.querySelectorAll(".copy-btn"), function(btn){
+      btn.addEventListener("click", function(){
+        var txt = $(btn.getAttribute("data-copy")).textContent;
+        var done = function(){ var o=btn.textContent; btn.textContent="Copied ✓"; setTimeout(function(){btn.textContent=o;},1600); };
+        if(navigator.clipboard && navigator.clipboard.writeText){
+          navigator.clipboard.writeText(txt).then(done, function(){fallbackCopy(txt,done);});
+        } else fallbackCopy(txt,done);
+      });
+    });
+  }
+  function fallbackCopy(txt,cb){
+    var ta=document.createElement("textarea"); ta.value=txt; ta.style.position="fixed"; ta.style.opacity="0";
+    document.body.appendChild(ta); ta.select();
+    try{document.execCommand("copy");}catch(e){}
+    document.body.removeChild(ta); cb&&cb();
+  }
+
+  // ---- inputs ----
+  function initInputs(){
+    $("in_gold").value = S.goldPx;
+    $("in_silver").value = S.silverPx;
+    $("in_lth").value = S.lthPct;
+    Array.prototype.forEach.call($("seg_dir").querySelectorAll("button"), function(b){
+      b.addEventListener("click", function(){
+        Array.prototype.forEach.call($("seg_dir").querySelectorAll("button"),function(x){x.classList.remove("on");});
+        b.classList.add("on"); S.lthDir = b.getAttribute("data-dir");
+      });
+    });
+    $("applyBtn").addEventListener("click", function(){
+      var g=parseFloat($("in_gold").value), s=parseFloat($("in_silver").value), l=parseFloat($("in_lth").value);
+      if(sane(g,500,20000) && g!==S.goldPx){ S.goldPx=g; S.health.gold="manual"; S.meta.gold={}; }
+      if(sane(s,2,500) && s!==S.silverPx){ S.silverPx=s; S.health.silver="manual"; S.meta.silver={}; }
+      if(sane(l,40,90) && l!==S.lthPct){ S.lthPct=l; S.lthTs=null; S.health.lth="manual"; S.meta.lth={}; }
+      render();
+      $("applyBtn").textContent="Applied ✓";
+      setTimeout(function(){$("applyBtn").textContent="Apply & recompute";},1500);
+    });
+  }
+
+  function syncInputs(){
+    // reflect live-loaded values into the manual fields (unless being edited)
+    if(document.activeElement !== $("in_gold")) $("in_gold").value = Math.round(S.goldPx);
+    if(document.activeElement !== $("in_silver")) $("in_silver").value = fmt(S.silverPx,1);
+    if(document.activeElement !== $("in_lth")) $("in_lth").value = fmt(S.lthPct,1);
+  }
+
+  // ---- boot ----
+  renderGauge();
+  initInputs();
+  render(); // paint seeds immediately so the page is never blank
+
+  // LTH runs after BTC so % conversion uses live circulating supply
+  var btcLeg = loadBTC();
+  var legs = [btcLeg, loadMetals(), btcLeg.then(loadLTH), loadHistory()];
+  // progressive paint as each leg lands, plus a final settle
+  legs.forEach(function(p){ p.then(function(){ syncInputs(); render(); }); });
+  Promise.all(legs).then(function(){ syncInputs(); render(); });
+
+})();
+</script>
+</body>
+</html>
