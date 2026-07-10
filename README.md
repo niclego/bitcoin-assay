@@ -1,5 +1,7 @@
 # The Assay
 
+**Live: [niclego.github.io/bitcoin-assay](https://niclego.github.io/bitcoin-assay/)**
+
 A single-file, mobile-first instrument tracking one long-horizon thesis: **is Bitcoin
 gradually maturing into "digital gold"?** Open it weekly or monthly; it pulls fresh
 numbers on load and tells you plainly when it couldn't.
